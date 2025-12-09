@@ -1,0 +1,5 @@
+service_name: web_master
+collector_url: "http://collector:8000"
+storage_url: "http://storage:8000"
+ml_url: "http://ml_service:8000"
+request_timeout: 300.0

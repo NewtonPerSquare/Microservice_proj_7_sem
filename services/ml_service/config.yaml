@@ -1,0 +1,18 @@
+service_name: ml_service
+
+#простая модель
+model_path: "/data/model.joblib"
+train_data_path: "/data/storage.csv"
+
+#soft sensor RandomForest
+softsensor_model_path: "/data/softsensor_model.joblib"
+softsensor_train_data_path: "/data/DataSet1_60T.csv"
+softsensor_target_col: "35_21_1000.Q.KatKlAB.EBen70"
+softsensor_sep: ";"
+
+#soft sensor SDVAE/MUDVAE
+softsensor_sdvae_model_path: "/data/softsensor_sdvae.joblib"
+softsensor_meta_path: "/data/DataSet1.json"
+
+log_path: "/app/logs/ml_service.log"
+

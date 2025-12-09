@@ -1,0 +1,466 @@
+import pandas as pd
+import json
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import linkage, dendrogram
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import numpy as np
+from torch.utils.data import TensorDataset, DataLoader
+import scipy.stats as stats
+import plotly.graph_objects as go
+from scipy.stats import pearsonr
+
+target_col = "35_21_1000.Q.KatKlAB.EBen70"
+
+
+class SDVAE(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dims, latent_dim, dropout_rate=0.1, alpha=1e-4):
+        super(SDVAE, self).__init__()
+
+        self.alpha = alpha
+        encoder_layers = []
+        current_dim = input_dim
+        for h_dim in hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(current_dim, h_dim),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(dropout_rate)
+            ])
+            current_dim = h_dim
+
+        self.encoder = nn.Sequential(*encoder_layers)
+        self.fc_mu = nn.Linear(current_dim, latent_dim)
+        self.fc_logvar = nn.Linear(current_dim, latent_dim)
+
+        # Decoder
+        decoder_layers = []
+        current_dim = latent_dim
+        for h_dim in reversed(hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(current_dim, h_dim),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(dropout_rate)
+            ])
+            current_dim = h_dim
+
+        self.decoder_layers = nn.Sequential(*decoder_layers)
+        self.fc_decoder = nn.Linear(current_dim, output_dim)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def decode(self, z):
+        h = self.decoder_layers(z)
+        return self.fc_decoder(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, xy_batch):
+        h = self.encoder(xy_batch)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        z = 0
+        L = 20
+        z_samples = []
+        for _ in range(L):
+            z_sample = self.reparameterize(mu, logvar)
+            z_samples.append(z_sample)
+
+        z = torch.stack(z_samples).mean(dim=0)
+        recon_x = self.fc_decoder(self.decoder_layers(z))
+        return recon_x, mu, logvar
+
+    '''
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+    '''
+
+    def loss_function(self, recon_x, x, mu, logvar, kld_weight=0.01):
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+        kl_div = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())  # mean?
+
+        l2 = torch.tensor(0.).to(x.device)
+        for param in self.parameters():
+            l2 += torch.norm(param, p=2)
+        return recon_loss + kl_div * kld_weight + l2 * self.alpha
+
+
+class MUDVAE(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dims, latent_dim, dropout_rate=0.1, alpha=1e-4):
+        super(MUDVAE, self).__init__()
+
+        # Encoder (только для x)
+        encoder_layers = []
+        current_dim = input_dim
+        for h_dim in hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(current_dim, h_dim),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(dropout_rate)
+            ])
+            current_dim = h_dim
+
+        self.encoder = nn.Sequential(*encoder_layers)
+        self.fc_mu = nn.Linear(current_dim, latent_dim)
+        self.fc_logvar = nn.Linear(current_dim, latent_dim)
+        self.alpha = alpha
+
+        # Decoder
+        decoder_layers = []
+        current_dim = latent_dim
+        for h_dim in reversed(hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(current_dim, h_dim),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(dropout_rate)
+            ])
+            current_dim = h_dim
+
+        self.decoder_layers = nn.Sequential(*decoder_layers)
+        self.fc_decoder = nn.Linear(current_dim, output_dim)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def decode(self, z):
+        h = self.decoder_layers(z)
+        return self.fc_decoder(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decode(z)
+        return recon_x, mu, logvar
+
+    def loss_function(self, recon_x, x, mu, logvar, mu_prior, logvar_prior, kld_weight=0.01):
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+        var_prior = torch.exp(logvar_prior)
+        var = torch.exp(logvar)
+        kl_div = 0.5 * torch.sum(
+            logvar_prior - logvar + (var + (mu - mu_prior) ** 2) / var_prior - 1
+        )
+        l2 = torch.tensor(0.).to(x.device)
+        for param in self.parameters():
+            l2 += torch.norm(param, p=2)
+        return recon_loss + kl_div * kld_weight + l2 * self.alpha
+
+
+def categorize_columns(data):
+    cv_columns = []
+    mv_columns = []
+    dv_columns = []
+
+    for key, value in data['ColumnKind'].items():
+        if value == 'CV':
+            cv_columns.append(key)
+        elif value == 'MV':
+            mv_columns.append(key)
+        elif value == 'DV':
+            dv_columns.append(key)
+
+    return cv_columns, mv_columns, dv_columns
+
+
+def filter_columns(data, columns):
+    return list(set(columns).intersection(data.columns))
+
+
+def is_piecewise_constant(data, column_name, threshold=0.1):
+    column = data[column_name]
+    changes = (column != column.shift()).sum()
+    change_ratio = changes / len(column)
+    return change_ratio < threshold
+
+
+def find_piecewise_constant_columns(data, threshold=0.1):
+    piecewise_constant_columns = []
+    for column in data.columns:
+        if is_piecewise_constant(data, column, threshold):
+            piecewise_constant_columns.append(column)
+    return piecewise_constant_columns
+
+
+def remove_piecewise_constant_columns(data, threshold=0.1):
+    piecewise_constant_columns = find_piecewise_constant_columns(data, threshold)
+    return data.drop(columns=piecewise_constant_columns)
+
+
+with open('DataSet1.json', 'r') as f:
+    jdata = json.load(f)
+
+# Разделение столбцов по типам
+cv_columns, mv_columns, dv_columns = categorize_columns(jdata)
+
+data = pd.read_csv('DataSet1_60T.csv', sep=';', low_memory=False)
+
+# Фильтрация по типам
+cv_columns_in_data = filter_columns(data, cv_columns)
+mv_columns_in_data = filter_columns(data, mv_columns)
+dv_columns_in_data = filter_columns(data, dv_columns)
+
+cv_data = data[cv_columns_in_data]
+mv_data = data[mv_columns_in_data]
+dv_data = data[dv_columns_in_data]
+cv_data = cv_data.astype(float)
+mv_data = mv_data.astype(float)
+dv_data = dv_data.astype(float)
+
+cv_data = remove_piecewise_constant_columns(cv_data)
+mv_data = remove_piecewise_constant_columns(mv_data)
+dv_data = remove_piecewise_constant_columns(dv_data)
+'''
+mcd_data = pd.concat([mv_data, cv_data, dv_data], axis=1)
+
+correlation = mcd_data.corr()
+mm_corr = correlation.loc[mv_data.columns, mv_data.columns]
+cc_corr = correlation.loc[cv_data.columns, cv_data.columns]
+dd_corr = correlation.loc[dv_data.columns, dv_data.columns]
+mc_corr = correlation.loc[mv_data.columns, cv_data.columns]
+md_corr = correlation.loc[mv_data.columns, dv_data.columns]
+cd_corr = correlation.loc[cv_data.columns, dv_data.columns]
+
+
+#Построение тепловых карт
+plot_heatmap(mm_corr, 'MM Correlation Matrix')
+plot_heatmap(cc_corr, 'CC Correlation Matrix')
+plot_heatmap(dd_corr, 'DD Correlation Matrix')
+plot_heatmap(mc_corr, 'MC Correlation Matrix')
+plot_heatmap(md_corr, 'MD Correlation Matrix')
+plot_heatmap(cd_corr, 'CD Correlation Matrix')
+
+#Построение дендрограммы
+plot_dendrogram(mcd_data.corr())
+'''
+data = pd.read_csv('DataSet1_60T.csv', sep=';', low_memory=False)
+date_cols = data.select_dtypes(include=['object']).columns
+for col in date_cols:
+    if any(data[col].str.contains(r'\d{2}\.\d{2}\.\d{4}', na=False)):
+        data = data.drop(columns=[col])
+
+data = data[data[target_col].diff().ne(0)].reset_index(drop=True)
+
+y = data[[target_col]]
+
+cv_data = data[cv_columns_in_data]
+mv_data = data[mv_columns_in_data]
+dv_data = data[dv_columns_in_data]
+cv_data = cv_data.astype(float)
+mv_data = mv_data.astype(float)
+dv_data = dv_data.astype(float)
+cv_data = remove_piecewise_constant_columns(cv_data, 0.5)
+mv_data = remove_piecewise_constant_columns(mv_data, 0.5)
+dv_data = remove_piecewise_constant_columns(dv_data, 0.5)
+
+X = pd.concat([cv_data, mv_data, dv_data], axis=1).astype(float)
+
+X = X.select_dtypes(include=['number'])
+X = X.loc[:, X.nunique() > 1]
+
+x_train, x_test, y_train, y_test = train_test_split(X, y, test_size=0.1, shuffle=False)
+
+xy_train = pd.concat([x_train, y_train], axis=1)
+xy_test = pd.concat([x_test, y_test], axis=1)
+
+xy_scaler = MinMaxScaler()
+xy_train_scaled = xy_scaler.fit_transform(xy_train)
+xy_test_scaled = xy_scaler.transform(xy_test)
+
+device = "cuda:0"
+
+####################
+input_dim = xy_train.shape[1]
+hidden_dims = [1024, 256]
+latent_dim = 10
+output_dim = xy_train.shape[1]
+batch_size = 20
+learning_rate = 5e-3
+alpha = 2e-3
+####################
+
+
+sdvae = SDVAE(input_dim, output_dim, hidden_dims, latent_dim, alpha=alpha).to(device)
+mudvae = MUDVAE(input_dim=x_train.shape[1], output_dim=x_train.shape[1], hidden_dims=[1024, 256], latent_dim=10,
+                alpha=3e-4).to(device)
+optimizer = optim.AdamW(sdvae.parameters(), lr=learning_rate, weight_decay=1e-5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+train_dataset_sdvae = TensorDataset(
+    torch.tensor(xy_train_scaled, dtype=torch.float32),
+    torch.tensor(xy_train_scaled, dtype=torch.float32)
+)
+train_loader_sdvae = DataLoader(train_dataset_sdvae, batch_size=batch_size, shuffle=False)
+
+num_epochs = 10000
+best_loss1 = float('inf')
+patience1 = 8
+counter1 = 0
+best_sdvae_state = sdvae.state_dict()
+
+for epoch in range(num_epochs):
+    epoch_loss = 0.0
+    for xy_batch, _ in train_loader_sdvae:
+        xy_batch = xy_batch.to(device)
+
+        optimizer.zero_grad()
+        recon_xy, mu, logvar = sdvae(xy_batch)
+        loss = sdvae.loss_function(recon_xy, xy_batch, mu, logvar)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(sdvae.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+    epoch_loss /= len(train_loader_sdvae)
+    scheduler.step(epoch_loss)
+    print(f'Epoch [{epoch + 1}/{num_epochs}], Recon Loss: {epoch_loss:.4f}')
+
+    # Early stopping
+    if epoch_loss < best_loss1:
+        best_loss1 = epoch_loss
+        best_sdvae_state = sdvae.state_dict()
+        print(f"saved in [{epoch}]")
+        counter1 = 0
+    else:
+        counter1 += 1
+        if counter1 >= patience1:
+            print("Early stopping!")
+            break
+
+sdvae.load_state_dict(best_sdvae_state)
+sdvae.eval()
+with torch.no_grad():
+    xy_tensor = torch.tensor(xy_train_scaled, dtype=torch.float32).to(device)
+    mu_prior, logvar_prior = sdvae.encode(xy_tensor)
+
+x_scaler = MinMaxScaler()
+x_train_scaled = x_scaler.fit_transform(x_train)
+x_test_scaled = x_scaler.transform(x_test)
+###############################################################################################
+optimizer_mudvae = optim.AdamW(mudvae.parameters(), lr=3e-3, weight_decay=1e-5)
+################################################################################################
+train_dataset_mudvae = TensorDataset(
+    torch.tensor(x_train_scaled, dtype=torch.float32),
+    torch.tensor(mu_prior.cpu().numpy(), dtype=torch.float32),
+    torch.tensor(logvar_prior.cpu().numpy(), dtype=torch.float32)
+)
+train_loader_mudvae = DataLoader(train_dataset_mudvae, batch_size=batch_size, shuffle=False)
+
+num_epochs = 10000
+best_loss2 = float('inf')
+patience2 = 5
+counter2 = 0
+best_mudvae_state = mudvae.state_dict()
+
+for epoch in range(num_epochs):
+    mudvae.train()
+    epoch_loss = 0.0
+    for x_batch, mu_batch, logvar_batch in train_loader_mudvae:
+        x_batch = x_batch.to(device)
+        mu_batch = mu_batch.to(device)
+        logvar_batch = logvar_batch.to(device)
+
+        optimizer_mudvae.zero_grad()
+        recon_x, mu, logvar = mudvae(x_batch)
+        loss = mudvae.loss_function(recon_x, x_batch, mu, logvar, mu_batch, logvar_batch)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(mudvae.parameters(), max_norm=1.0)
+        optimizer_mudvae.step()
+        epoch_loss += loss.item()
+
+    epoch_loss /= len(train_loader_mudvae)
+    scheduler.step(epoch_loss)
+    print(f'Epoch [{epoch + 1}/{num_epochs}], Recon Loss: {epoch_loss:.4f}')
+
+    # Early stopping
+    if epoch_loss < best_loss2:
+        best_loss2 = epoch_loss
+        best_mudvae_state = mudvae.state_dict()
+        counter2 = 0
+    else:
+        counter2 += 1
+        if counter2 >= patience2:
+            print("Early stopping!")
+            break
+
+mudvae.load_state_dict(best_mudvae_state)
+
+
+class SoftSensor(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(SoftSensor, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, x):
+        mu, logvar = self.encoder.encode(x)
+        z = self.encoder.reparameterize(mu, logvar)
+        recon_xy = self.decoder.decode(z)
+        return recon_xy[:, -1]  # y же последний вроде
+
+
+soft_sensor = SoftSensor(mudvae, sdvae).to(device)
+
+with torch.no_grad():
+    x_test_tensor = torch.tensor(x_test_scaled, dtype=torch.float32).to(device)
+    y_pred_scaled = soft_sensor(x_test_tensor)
+
+    xy_test_pred = np.hstack([x_test_scaled, y_pred_scaled.cpu().numpy().reshape(-1, 1)])
+    y_pred = xy_scaler.inverse_transform(xy_test_pred)[:, -1]
+
+# Расчет метрик
+y_true = xy_scaler.inverse_transform(xy_test_scaled)[:, -1]
+mse = mean_squared_error(y_true, y_pred)
+mae = mean_absolute_error(y_true, y_pred)
+cone_percent = 0.05
+cone = cone_percent * np.mean(np.abs(y_true))
+hinge = np.abs(y_true - y_pred) - cone
+hinge = np.where(hinge < 0, 0, hinge).mean()
+r, p_value = pearsonr(y_true, y_pred)
+
+print(f"MSE: {mse:.4f}")
+print(f"MAE: {mae:.4f}")
+print(f"Hinge: {hinge:.4f}")
+print(f"Pearson: {r:.3f}")
+print(f"p-value: {p_value}")
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(y=y_true, mode='lines', name='True'))
+fig.add_trace(go.Scatter(y=y_pred, mode='lines', name='Predicted'))
+fig.update_layout(title='True vs Predicted Target')
+fig.show()

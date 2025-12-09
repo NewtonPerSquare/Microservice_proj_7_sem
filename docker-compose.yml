@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  collector:
+    build:
+      context: ./services/collector
+    container_name: softsensor_collector
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data:/data
+
+  storage:
+    build:
+      context: ./services/storage
+    container_name: softsensor_storage
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./data:/data
+
+  ml_service:
+    build:
+      context: ./services/ml_service
+    container_name: softsensor_ml_service
+    ports:
+      - "8003:8000"
+    volumes:
+      - ./data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ "gpu" ]
+
+  web_master:
+    build:
+      context: ./services/web_master
+    container_name: softsensor_web_master
+    ports:
+      - "8000:8000"
+    depends_on:
+      - collector
+      - storage
+      - ml_service
+    volumes:
+      - ./data:/data
+
+  visualization:
+    build:
+      context: ./services/visualization
+    container_name: softsensor_visualization
+    ports:
+      - "8004:8000"
+    depends_on:
+      - web_master
